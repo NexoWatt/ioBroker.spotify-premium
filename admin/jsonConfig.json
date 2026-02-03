@@ -1,0 +1,71 @@
+{
+  "i18n": true,
+  "type": "panel",
+  "items": {
+    "_header": {
+      "type": "header",
+      "text": "Spotify Premium (Web API)"
+    },
+    "_info": {
+      "type": "staticText",
+      "text": "Du brauchst eine Spotify Developer App + Refresh-Token. Siehe README im Repo (tools/getRefreshToken.js)."
+    },
+    "clientId": {
+      "type": "text",
+      "label": "Client ID",
+      "help": "Aus dem Spotify Developer Dashboard",
+      "sm": 12,
+      "md": 6
+    },
+    "clientSecret": {
+      "type": "password",
+      "label": "Client Secret",
+      "help": "Wird verschl\u00fcsselt gespeichert (encryptedNative/protectedNative).",
+      "sm": 12,
+      "md": 6
+    },
+    "redirectUri": {
+      "type": "text",
+      "label": "Redirect URI",
+      "help": "Muss exakt so im Spotify Developer Dashboard hinterlegt sein, z.B. http://iobroker-host:8888/callback",
+      "sm": 12,
+      "md": 12
+    },
+    "refreshToken": {
+      "type": "password",
+      "label": "Refresh Token",
+      "help": "Einmalig per tools/getRefreshToken.js erzeugen. Wird verschl\u00fcsselt gespeichert.",
+      "sm": 12,
+      "md": 12
+    },
+    "defaultDeviceId": {
+      "type": "text",
+      "label": "Default Device ID (optional)",
+      "help": "Optional: Device-ID, auf die Befehle standardm\u00e4\u00dfig gehen sollen (Spotify Connect).",
+      "sm": 12,
+      "md": 12
+    },
+    "pollInterval": {
+      "type": "number",
+      "label": "Polling Intervall (Sekunden)",
+      "help": "Wie oft soll der aktuelle Playback-Status abgefragt werden.",
+      "min": 2,
+      "max": 60,
+      "step": 1,
+      "sm": 12,
+      "md": 4
+    },
+    "autoRefreshDevicesOnStart": {
+      "type": "checkbox",
+      "label": "Devices beim Start aktualisieren",
+      "sm": 12,
+      "md": 4
+    },
+    "logApiErrors": {
+      "type": "checkbox",
+      "label": "API-Fehler detailliert loggen",
+      "sm": 12,
+      "md": 4
+    }
+  }
+}
