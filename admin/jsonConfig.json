@@ -1,71 +1,136 @@
 {
   "i18n": true,
-  "type": "panel",
+  "type": "tabs",
   "items": {
-    "_header": {
-      "type": "header",
-      "text": "Spotify Premium (Web API)"
+    "_spotify": {
+      "type": "panel",
+      "label": "Spotify Login",
+      "items": {
+        "_alive": {
+          "type": "alive",
+          "sm": 12,
+          "textAlive": "✅ Instanz läuft (Adapter ist online)",
+          "textNotAlive": "⚠️ Instanz ist offline – bitte Instanz starten, damit der Login-Button funktioniert"
+        },
+        "_hint": {
+          "type": "staticText",
+          "sm": 12,
+          "text": "<b>Wichtig:</b> Spotify nutzt OAuth. Du meldest dich bei Spotify an (im Browser), danach speichert der Adapter automatisch ein Refresh-Token.\n<br/><br/>\n<b>Spotify Security-Update:</b> Seit 27.11.2025 sind <i>unsichere</i> Redirect-URIs eingeschränkt. Für Redirects zu einem LAN-Host brauchst du i.d.R. <b>HTTPS</b>. HTTP geht nur für Loopback (z.B. <code>http://127.0.0.1:PORT</code>) – das funktioniert nur, wenn du den Browser direkt auf dem ioBroker-Host nutzt.\n<br/><br/>\n👉 Empfohlen: Nutze <b>https</b> in der Redirect-URI. Wenn du kein gültiges Zertifikat hast, kann der Adapter ein <i>Self-Signed</i> Zertifikat erzeugen (Browser-Warnung muss einmal bestätigt werden).<br/><br/><b>Hinweis:</b> Nach erfolgreichem Login bitte die Konfig-Seite einmal neu laden (F5), bevor du 'Speichern' klickst – sonst könnte ein noch altes (leeres) Token versehentlich überschrieben werden."
+        },
+        "clientId": {
+          "type": "text",
+          "label": "Spotify Client ID",
+          "sm": 12,
+          "md": 6,
+          "help": "Spotify Developer Dashboard → App → Client ID"
+        },
+        "clientSecret": {
+          "type": "password",
+          "label": "Spotify Client Secret",
+          "sm": 12,
+          "md": 6,
+          "help": "Spotify Developer Dashboard → App → Client Secret (wird verschlüsselt gespeichert)"
+        },
+        "redirectUri": {
+          "type": "text",
+          "label": "Redirect URI (Callback URL)",
+          "sm": 12,
+          "help": "Diese URL musst du 1:1 in Spotify Developer Dashboard → App → Edit Settings → Redirect URIs eintragen. Beispiel: https://iobroker.lan:8888/callback"
+        },
+        "bind": {
+          "type": "ip",
+          "label": "Callback-Server Bind-IP",
+          "sm": 12,
+          "md": 6,
+          "help": "Meist 0.0.0.0 (alle Interfaces). Bei Problemen (Port belegt/Netzwerk) anpassen."
+        },
+        "useSelfSignedCert": {
+          "type": "checkbox",
+          "label": "Self-Signed Zertifikat erzeugen (wenn Redirect URI https ist)",
+          "sm": 12,
+          "md": 6,
+          "help": "Wenn du https in der Redirect URI nutzt und kein Zertifikat hinterlegt hast, erzeugt der Adapter beim Start ein Self-Signed Zertifikat."
+        },
+        "_connect": {
+          "type": "sendTo",
+          "label": "🔗 Mit Spotify verbinden",
+          "command": "oauthStart",
+          "openUrl": true,
+          "showProcess": true,
+          "jsonData": "{\"origin\":\"${data._origin}\",\"originIp\":\"${data._originIp}\",\"clientId\":\"${data.clientId}\",\"clientSecret\":\"${data.clientSecret}\",\"redirectUri\":\"${data.redirectUri}\",\"bind\":\"${data.bind}\",\"useSelfSignedCert\":${data.useSelfSignedCert}}"
+        },
+        "_status": {
+          "type": "textSendTo",
+          "label": "Status",
+          "sm": 12,
+          "command": "oauthStatus",
+          "jsonData": "{\"clientId\":\"${data.clientId}\",\"redirectUri\":\"${data.redirectUri}\"}",
+          "alsoDependsOn": [
+            "clientId",
+            "redirectUri",
+            "refreshToken"
+          ]
+        },
+        "_disconnect": {
+          "type": "sendTo",
+          "label": "🧹 Verbindung trennen (Refresh-Token löschen)",
+          "command": "oauthDisconnect",
+          "showProcess": true,
+          "useNative": true,
+          "jsonData": "{}"
+        },
+        "refreshToken": {
+          "type": "password",
+          "label": "Refresh Token (automatisch)",
+          "sm": 12,
+          "help": "Wird nach erfolgreichem Login automatisch gespeichert. Normalerweise musst du hier nichts eintragen.",
+          "hidden": true
+        }
+      }
     },
-    "_info": {
-      "type": "staticText",
-      "text": "Du brauchst eine Spotify Developer App + Refresh-Token. Siehe README im Repo (tools/getRefreshToken.js)."
-    },
-    "clientId": {
-      "type": "text",
-      "label": "Client ID",
-      "help": "Aus dem Spotify Developer Dashboard",
-      "sm": 12,
-      "md": 6
-    },
-    "clientSecret": {
-      "type": "password",
-      "label": "Client Secret",
-      "help": "Wird verschl\u00fcsselt gespeichert (encryptedNative/protectedNative).",
-      "sm": 12,
-      "md": 6
-    },
-    "redirectUri": {
-      "type": "text",
-      "label": "Redirect URI",
-      "help": "Muss exakt so im Spotify Developer Dashboard hinterlegt sein, z.B. http://iobroker-host:8888/callback",
-      "sm": 12,
-      "md": 12
-    },
-    "refreshToken": {
-      "type": "password",
-      "label": "Refresh Token",
-      "help": "Einmalig per tools/getRefreshToken.js erzeugen. Wird verschl\u00fcsselt gespeichert.",
-      "sm": 12,
-      "md": 12
-    },
-    "defaultDeviceId": {
-      "type": "text",
-      "label": "Default Device ID (optional)",
-      "help": "Optional: Device-ID, auf die Befehle standardm\u00e4\u00dfig gehen sollen (Spotify Connect).",
-      "sm": 12,
-      "md": 12
-    },
-    "pollInterval": {
-      "type": "number",
-      "label": "Polling Intervall (Sekunden)",
-      "help": "Wie oft soll der aktuelle Playback-Status abgefragt werden.",
-      "min": 2,
-      "max": 60,
-      "step": 1,
-      "sm": 12,
-      "md": 4
-    },
-    "autoRefreshDevicesOnStart": {
-      "type": "checkbox",
-      "label": "Devices beim Start aktualisieren",
-      "sm": 12,
-      "md": 4
-    },
-    "logApiErrors": {
-      "type": "checkbox",
-      "label": "API-Fehler detailliert loggen",
-      "sm": 12,
-      "md": 4
+    "_playback": {
+      "type": "panel",
+      "label": "Playback & Geräte",
+      "items": {
+        "_playHint": {
+          "type": "staticText",
+          "sm": 12,
+          "text": "💡 Steuerung klappt nur, wenn mindestens ein Spotify Connect Gerät im Account aktiv ist (z.B. Spotify App am Handy/PC)."
+        },
+        "defaultDeviceId": {
+          "type": "selectSendTo",
+          "label": "Standard-Gerät (optional)",
+          "sm": 12,
+          "command": "listDevices",
+          "manual": true,
+          "noTranslation": true,
+          "alsoDependsOn": [
+            "refreshToken"
+          ],
+          "help": "Wenn gesetzt, werden Play/Pause/Next/etc. bevorzugt an dieses Device gesendet."
+        },
+        "pollInterval": {
+          "type": "number",
+          "min": 2,
+          "max": 60,
+          "label": "Polling-Intervall (Sekunden)",
+          "sm": 12,
+          "md": 6,
+          "help": "Wie oft der Adapter den Wiedergabe-Status abruft."
+        },
+        "autoRefreshDevicesOnStart": {
+          "type": "checkbox",
+          "label": "Geräteliste beim Start aktualisieren",
+          "sm": 12,
+          "md": 6
+        },
+        "logApiErrors": {
+          "type": "checkbox",
+          "label": "Spotify API Errors im Log ausgeben",
+          "sm": 12,
+          "md": 6
+        }
+      }
     }
   }
 }

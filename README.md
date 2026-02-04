@@ -19,65 +19,70 @@ Ein **ioBroker Adapter**, der **Spotify Premium** über die **Spotify Web API (S
   - URI abspielen (Track/Playlist/Album/Artist)
   - In Queue hinzufügen
   - Playback auf Device übertragen
-  - Geräte-Liste abrufen
+  - Geräte-Liste abrufen (Spotify Connect)
 
 ---
 
 ## Voraussetzungen
 
-- ioBroker mit Node.js **>= 18** (aktuelle Adapter-Tooling und Templates setzen i.d.R. mindestens Node 18 voraus).
+- ioBroker mit Node.js **>= 18**
 - Spotify **Premium** Account
 - Spotify Developer App (Client ID / Client Secret + Redirect URI)
 
 ---
 
-## Spotify App anlegen (Developer Dashboard)
+## Spotify Developer App anlegen
 
 1. Im Spotify Developer Dashboard eine App erstellen
-2. **Redirect URI** in der App hinterlegen, z.B.:
+2. Unter **Edit Settings → Redirect URIs** eine Redirect URI eintragen, die **exakt** zum Adapter passt.
 
+### Redirect URI Beispiele
+
+**Empfohlen (HTTPS, LAN/DNS):**
 ```
-http://<DEIN-IOBROKER-HOST>:8888/callback
+https://iobroker.lan:8888/callback
 ```
 
-Wichtig: Das muss **exakt** mit der Redirect URI im Script/Adapter übereinstimmen.
+**Nur wenn Browser direkt auf dem ioBroker-Host läuft (Loopback):**
+```
+http://127.0.0.1:8888/callback
+```
+
+> Hintergrund: Spotify hat die Anforderungen an Redirect URIs verschärft (HTTP ist nur noch für Loopback-Adressen praktikabel). Für typische Heimnetz-Setups ist **HTTPS** der sichere Weg.
 
 ---
 
-## Refresh Token holen (einmalig)
+## Login / Verbindung herstellen (wie “andere Hersteller”) 🔗
 
-Im Repo ist ein Helper-Script enthalten:
+1. Adapter installieren & Instanz anlegen
+2. In den Instanz-Einstellungen eintragen:
+   - **Client ID**
+   - **Client Secret**
+   - **Redirect URI**
+   - optional: Bind-IP (meist `0.0.0.0`)
+   - optional: **Self-Signed Zertifikat erzeugen** (wenn Redirect URI `https://...` ist und du kein eigenes Zertifikat nutzt)
+3. Instanz starten (muss **online** sein)
+4. Button **„Mit Spotify verbinden“** klicken
+5. Im Browser bei Spotify anmelden und Zugriff bestätigen
+6. Im Callback-Fenster erscheint **„✅ Spotify verbunden“** → Fenster schließen
+
+> 💡 Danach bitte die Konfig-Seite einmal **neu laden (F5)**, bevor du „Speichern“ klickst, damit kein altes (leeres) Token versehentlich überschrieben wird.
+
+---
+
+## Optional: Refresh Token per Script holen (CLI)
+
+Wenn du den Login nicht über die Admin-Oberfläche machen willst, gibt es weiterhin ein Helper-Script:
 
 ```
 tools/getRefreshToken.js
 ```
 
-### Beispiel
-
-Auf dem ioBroker Host im Adapter-Ordner:
-
+Beispiel:
 ```bash
 cd /opt/iobroker/node_modules/iobroker.spotify-premium
-node tools/getRefreshToken.js --clientId "<CLIENT_ID>" --clientSecret "<CLIENT_SECRET>" --redirectUri "http://<DEIN-IOBROKER-HOST>:8888/callback"
+node tools/getRefreshToken.js --clientId "<CLIENT_ID>" --clientSecret "<CLIENT_SECRET>" --redirectUri "https://iobroker.lan:8888/callback"
 ```
-
-Das Script druckt eine URL aus → **im Browser öffnen**, einloggen, bestätigen.  
-Danach bekommst du im Terminal und im Browser den **Refresh Token** angezeigt.
-
-➡️ Diesen Refresh Token trägst du dann in den Adapter-Einstellungen ein.
-
----
-
-## Adapter konfigurieren (ioBroker Admin)
-
-In den Instanz-Einstellungen eintragen:
-
-- **Client ID**
-- **Client Secret**
-- **Redirect URI**
-- **Refresh Token**
-- optional: **Default Device ID**
-- Polling Intervall (Sekunden)
 
 ---
 
@@ -90,45 +95,30 @@ In den Instanz-Einstellungen eintragen:
 - `spotify-premium.0.playback.album`
 - `spotify-premium.0.playback.progressMs`
 - `spotify-premium.0.playback.durationMs`
-- `spotify-premium.0.playback.volume`
-- `spotify-premium.0.playback.deviceName`
 - `spotify-premium.0.playback.deviceId`
-- …
+- `spotify-premium.0.playback.deviceName`
+- `spotify-premium.0.playback.deviceType`
+- `spotify-premium.0.playback.volumePercent`
+- `spotify-premium.0.playback.shuffle`
+- `spotify-premium.0.playback.repeat`
 
 ### Control (write)
-- `spotify-premium.0.control.play` (true → Trigger)
-- `spotify-premium.0.control.pause`
-- `spotify-premium.0.control.toggle`
-- `spotify-premium.0.control.next`
-- `spotify-premium.0.control.previous`
+- `spotify-premium.0.control.play` (button)
+- `spotify-premium.0.control.pause` (button)
+- `spotify-premium.0.control.toggle` (button)
+- `spotify-premium.0.control.next` (button)
+- `spotify-premium.0.control.previous` (button)
 - `spotify-premium.0.control.volume` (0–100)
 - `spotify-premium.0.control.shuffle` (true/false)
-- `spotify-premium.0.control.repeat` ("off" | "context" | "track")
+- `spotify-premium.0.control.repeat` (off/track/context)
 - `spotify-premium.0.control.seek` (ms)
-- `spotify-premium.0.control.playUri` (z.B. `spotify:track:...` oder `spotify:playlist:...`)
-- `spotify-premium.0.control.addToQueue` (URI)
+- `spotify-premium.0.control.playUri` (spotify:track:..., spotify:playlist:..., ...)
+- `spotify-premium.0.control.addToQueue` (spotify:track:..., ...)
 - `spotify-premium.0.control.transferToDevice` (deviceId)
-- `spotify-premium.0.control.refreshDevices` (true → Trigger)
-
-### Devices
-- `spotify-premium.0.devices.json` enthält die verfügbaren Geräte als JSON.
-
----
-
-## Installation (Repo ZIP / GitHub / lokal)
-
-### Variante A: GitHub (typisch)
-1. Repo auf GitHub anlegen (Ordnername: `ioBroker.spotify-premium`)
-2. Code pushen
-3. Im ioBroker Admin bei **Adapter** die **Octocat/GitHub-Installation** nutzen (Achtung: GitHub-Versionen können „unter Entwicklung“ sein und du musst die Instanz ggf. manuell anlegen).
-
-### Variante B: Lokal (ohne GitHub)
-1. Ordner `ioBroker.spotify-premium` nach `/opt/iobroker/node_modules/iobroker.spotify-premium` kopieren
-2. im Ordner `npm install`
-3. `iobroker upload spotify-premium`
-4. Adapter-Instanz im Admin anlegen und konfigurieren
+- `spotify-premium.0.control.refreshDevices` (button)
 
 ---
 
 ## Lizenz
+
 MIT
