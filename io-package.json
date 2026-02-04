@@ -1,11 +1,19 @@
 {
   "common": {
     "name": "spotify-premium",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "news": {
+      "0.0.3": {
+        "en": "OAuth login flow (PKCE) in Admin + callback server; fixes connect button pop-up issues.",
+        "de": "OAuth-Login (PKCE) im Admin + Callback-Server; behebt Connect-Button/Pop-up-Probleme."
+      },
+      "0.0.2": {
+        "en": "OAuth login initial implementation.",
+        "de": "OAuth-Login initial implementiert."
+      },
       "0.0.1": {
-        "en": "Initial version",
-        "de": "Initiale Version"
+        "en": "Initial version.",
+        "de": "Initiale Version."
       }
     },
     "titleLang": {
@@ -27,9 +35,10 @@
     "icon": "spotify-premium.png",
     "enabled": true,
     "extIcon": "",
-    "readme": "https://example.com/README.md",
+    "readme": "",
     "type": "multimedia",
     "mode": "daemon",
+    "messagebox": true,
     "connectionType": "cloud",
     "dataSource": "poll",
     "adminUI": {
@@ -38,8 +47,14 @@
     "keywords": [
       "spotify",
       "music",
-      "player",
-      "premium"
+      "premium",
+      "oauth",
+      "spotify connect"
+    ],
+    "dependencies": [
+      {
+        "js-controller": ">=5.0.0"
+      }
     ],
     "encryptedNative": [
       "clientSecret",
@@ -48,52 +63,20 @@
     "protectedNative": [
       "clientSecret",
       "refreshToken"
-    ],
-    "dependencies": [
-      {
-        "js-controller": ">=5.0.0"
-      }
-    ],
-    "globalDependencies": [
-      {
-        "admin": ">=6.0.0"
-      }
-    ],
-    "tier": 2
+    ]
   },
   "native": {
     "clientId": "",
     "clientSecret": "",
     "redirectUri": "",
     "refreshToken": "",
+    "callbackBindIp": "0.0.0.0",
+    "generateSelfSignedCert": true,
     "defaultDeviceId": "",
     "pollInterval": 5,
-    "logApiErrors": false,
     "autoRefreshDevicesOnStart": true,
-    "bind": "0.0.0.0",
-    "useSelfSignedCert": true
+    "logApiErrors": false
   },
-  "instanceObjects": [
-    {
-      "_id": "info",
-      "type": "channel",
-      "common": {
-        "name": "Information"
-      },
-      "native": {}
-    },
-    {
-      "_id": "info.connection",
-      "type": "state",
-      "common": {
-        "name": "Connection",
-        "type": "boolean",
-        "role": "indicator.connected",
-        "read": true,
-        "write": false,
-        "def": false
-      },
-      "native": {}
-    }
-  ]
+  "objects": [],
+  "instanceObjects": []
 }

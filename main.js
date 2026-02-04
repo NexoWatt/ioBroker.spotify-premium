@@ -3,6 +3,7 @@
 /*
  * ioBroker.spotify-premium
  * Control Spotify Premium playback via Spotify Web API (Spotify Connect)
+ * OAuth login (Authorization Code + PKCE) via Admin.
  */
 
 const utils = require('@iobroker/adapter-core');
@@ -11,8 +12,38 @@ const { SpotifyClient } = require('./lib/spotifyClient');
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
-const { URL } = require('node:url');
+const fs = require('node:fs');
+const path = require('node:path');
 const net = require('node:net');
+
+let selfsigned = null;
+try {
+    selfsigned = require('selfsigned');
+} catch {
+    selfsigned = null;
+}
+
+function base64UrlEncode(buf) {
+    return Buffer.from(buf)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+}
+
+function sha256Base64Url(str) {
+    const hash = crypto.createHash('sha256').update(str).digest();
+    return base64UrlEncode(hash);
+}
+
+function safeUrl(url) {
+    try {
+        // Ensure URL is valid
+        return new URL(url).toString();
+    } catch {
+        return '';
+    }
+}
 
 class SpotifyPremiumAdapter extends utils.Adapter {
     constructor(options = {}) {
@@ -25,101 +56,81 @@ class SpotifyPremiumAdapter extends utils.Adapter {
         this.pollTimer = null;
         this.commandQueue = Promise.resolve();
 
-        // OAuth helper web server (callback receiver)
-        this.oauthServer = null;
-        this.oauthServerInfo = null;
-        this.oauthFlow = null;
+        // OAuth state -> verifier (and runtime config) map
+        this.oauthStates = new Map(); // state -> { codeVerifier, createdAt, clientId, redirectUri }
+        this.server = null;
+        this.serverInfo = null; // { protocol, port, path }
+        this.serverRuntimeConfig = null; // { generateSelfSignedCert: boolean }
+        this.serverRuntimeConfig = null; // { generateSelfSignedCert }
 
         this.on('ready', this.onReady.bind(this));
-        this.on('message', this.onMessage.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
+        this.on('message', this.onMessage.bind(this));
         this.on('unload', this.onUnload.bind(this));
     }
 
     async onReady() {
-        // Reset connection indicator
         await this.setStateAsync('info.connection', false, true);
 
-        // Create object tree
         await this.ensureObjectTree();
-
-        // Subscribe to control states
         this.subscribeStates('control.*');
 
-        // Basic config check
-        const { clientId, clientSecret, refreshToken, redirectUri } = this.config;
-
-        if (!clientId || !clientSecret || !redirectUri) {
-            this.log.warn(
-                'Adapter not configured yet (clientId/clientSecret/redirectUri missing). Please open the instance settings and configure the Spotify app credentials.'
-            );
-            return;
+        // Start callback server if redirect URI configured
+        if (this.config.redirectUri) {
+            try {
+                await this.startCallbackServer();
+            } catch (e) {
+                this.log.warn(`Callback server not started: ${e?.message || e}`);
+            }
         }
 
-        if (!refreshToken) {
-            this.log.warn(
-                'Not connected to Spotify yet (refreshToken missing). Open the instance settings and click "Mit Spotify verbinden".'
-            );
-            return;
+        // Init Spotify client if refresh token exists
+        if (this.config.clientId && this.config.refreshToken) {
+            await this.initSpotifyClient();
+        } else {
+            this.log.info('Spotify not authenticated yet. Use the Admin button "MIT SPOTIFY VERBINDEN".');
         }
 
+        if (this.spotify) {
+            if (this.config.autoRefreshDevicesOnStart) {
+                this.queueCommand(() => this.refreshDevices());
+            }
+
+            const intervalSec = Math.max(2, Number(this.config.pollInterval) || 5);
+            this.log.info(`Polling Spotify playback state every ${intervalSec}s`);
+            this.pollTimer = this.setInterval(() => {
+                this.queueCommand(() => this.pollPlayback());
+            }, intervalSec * 1000);
+
+            this.queueCommand(() => this.pollPlayback());
+        }
+    }
+
+    async initSpotifyClient() {
         this.spotify = new SpotifyClient({
-            clientId: String(clientId),
-            clientSecret: String(clientSecret),
-            refreshToken: String(refreshToken),
-            redirectUri: String(redirectUri || ''),
+            clientId: String(this.config.clientId),
+            clientSecret: String(this.config.clientSecret || ''),
+            refreshToken: String(this.config.refreshToken || ''),
             log: this.log,
         });
 
         try {
             await this.spotify.refreshAccessToken();
             await this.setStateAsync('info.connection', true, true);
+            this.log.info('Spotify authenticated ✅');
         } catch (e) {
-            this.log.error(`Failed to authenticate with Spotify: ${e?.message || e}`);
             await this.setStateAsync('info.connection', false, true);
-            return;
+            this.log.error(`Failed to authenticate with Spotify: ${e?.message || e}`);
+            this.spotify = null;
         }
-
-        // Optional: refresh device list on start
-        if (this.config.autoRefreshDevicesOnStart) {
-            this.queueCommand(() => this.refreshDevices());
-        }
-
-        // Start polling playback state
-        const intervalSec = Math.max(2, Number(this.config.pollInterval) || 5);
-        this.log.info(`Polling Spotify playback state every ${intervalSec}s`);
-        this.pollTimer = this.setInterval(() => {
-            this.queueCommand(() => this.pollPlayback());
-        }, intervalSec * 1000);
-
-        // Initial poll
-        this.queueCommand(() => this.pollPlayback());
     }
 
-    /**
-     * Ensure channels + states exist.
-     */
+    /** Ensure channels + states exist. */
     async ensureObjectTree() {
-        // Channels
-        await this.setObjectNotExistsAsync('playback', {
-            type: 'channel',
-            common: { name: 'Playback' },
-            native: {},
-        });
+        await this.setObjectNotExistsAsync('playback', { type: 'channel', common: { name: 'Playback' }, native: {} });
+        await this.setObjectNotExistsAsync('control', { type: 'channel', common: { name: 'Control' }, native: {} });
+        await this.setObjectNotExistsAsync('devices', { type: 'channel', common: { name: 'Devices' }, native: {} });
 
-        await this.setObjectNotExistsAsync('control', {
-            type: 'channel',
-            common: { name: 'Control' },
-            native: {},
-        });
-
-        await this.setObjectNotExistsAsync('devices', {
-            type: 'channel',
-            common: { name: 'Devices' },
-            native: {},
-        });
-
-        // Playback states (read-only)
         const playbackStates = [
             ['playback.available', { name: 'Playback available (active device)', type: 'boolean', role: 'indicator.state', read: true, write: false, def: false }],
             ['playback.isPlaying', { name: 'Is playing', type: 'boolean', role: 'media.state', read: true, write: false, def: false }],
@@ -140,28 +151,15 @@ class SpotifyPremiumAdapter extends utils.Adapter {
         ];
 
         for (const [id, common] of playbackStates) {
-            await this.setObjectNotExistsAsync(id, {
-                type: 'state',
-                common,
-                native: {},
-            });
+            await this.setObjectNotExistsAsync(id, { type: 'state', common, native: {} });
         }
 
-        // Devices
         await this.setObjectNotExistsAsync('devices.json', {
             type: 'state',
-            common: {
-                name: 'Available devices (JSON)',
-                type: 'string',
-                role: 'json',
-                read: true,
-                write: false,
-                def: '[]',
-            },
+            common: { name: 'Available devices (JSON)', type: 'string', role: 'json', read: true, write: false, def: '[]' },
             native: {},
         });
 
-        // Control states
         const controlStates = [
             ['control.play', { name: 'Play', type: 'boolean', role: 'button.play', read: true, write: true, def: false }],
             ['control.pause', { name: 'Pause', type: 'boolean', role: 'button.pause', read: true, write: true, def: false }],
@@ -179,17 +177,11 @@ class SpotifyPremiumAdapter extends utils.Adapter {
         ];
 
         for (const [id, common] of controlStates) {
-            await this.setObjectNotExistsAsync(id, {
-                type: 'state',
-                common,
-                native: {},
-            });
+            await this.setObjectNotExistsAsync(id, { type: 'state', common, native: {} });
         }
     }
 
-    /**
-     * Serialize command executions to avoid race conditions / hitting rate limits.
-     */
+    /** Serialize command executions. */
     queueCommand(fn) {
         this.commandQueue = this.commandQueue
             .then(() => fn())
@@ -203,8 +195,29 @@ class SpotifyPremiumAdapter extends utils.Adapter {
     }
 
     /**
-     * Poll playback state from Spotify and update ioBroker states.
+     * Merge saved config with runtime values passed from Admin via jsonData.
+     * This is important because users may click "MIT SPOTIFY VERBINDEN" before pressing "Speichern".
      */
+    getEffectiveConfigFromMessage(message) {
+        const m = (message && typeof message === 'object') ? message : {};
+
+        const out = {
+            clientId: (typeof m.clientId === 'string' ? m.clientId : this.config.clientId) || '',
+            clientSecret: (typeof m.clientSecret === 'string' ? m.clientSecret : this.config.clientSecret) || '',
+            redirectUri: (typeof m.redirectUri === 'string' ? m.redirectUri : this.config.redirectUri) || '',
+            callbackBindIp: (typeof m.callbackBindIp === 'string' ? m.callbackBindIp : this.config.callbackBindIp) || '0.0.0.0',
+            generateSelfSignedCert: (typeof m.generateSelfSignedCert === 'boolean' ? m.generateSelfSignedCert : !!this.config.generateSelfSignedCert),
+        };
+
+        return {
+            ...out,
+            clientId: String(out.clientId).trim(),
+            clientSecret: String(out.clientSecret).trim(),
+            redirectUri: String(out.redirectUri).trim(),
+            callbackBindIp: String(out.callbackBindIp).trim() || '0.0.0.0',
+        };
+    }
+
     async pollPlayback() {
         if (!this.spotify) return;
 
@@ -247,581 +260,20 @@ class SpotifyPremiumAdapter extends utils.Adapter {
 
     async refreshDevices() {
         if (!this.spotify) return;
-
         const devices = await this.spotify.getDevices();
-        const jsonStr = JSON.stringify(devices, null, 2);
-        await this.setStateAsync('devices.json', jsonStr, true);
+        await this.setStateAsync('devices.json', JSON.stringify(devices, null, 2), true);
     }
 
-    /**
-     * Handle admin UI sendTo requests (JSON config).
-     * @param {ioBroker.Message} obj
-     */
-    async onMessage(obj) {
-        if (!obj || !obj.command) return;
-
-        const command = obj.command;
-        const message = obj.message || {};
-        const reply = (payload) =>
-            obj.callback && this.sendTo(obj.from, obj.command, payload, obj.callback);
-
-        try {
-            switch (command) {
-                case 'oauthStart':
-                    reply(await this.oauthStart(message));
-                    break;
-
-                case 'oauthStatus':
-                    reply(await this.oauthStatus());
-                    break;
-
-                case 'oauthDisconnect':
-                    reply(await this.oauthDisconnect());
-                    break;
-
-                case 'listDevices':
-                    reply(await this.listDevices());
-                    break;
-
-                default:
-                    // Ignore unknown commands
-                    break;
-            }
-        } catch (e) {
-            const errText = e && e.message ? e.message : String(e);
-            this.log.error(`onMessage(${command}) failed: ${errText}`);
-            if (command === 'oauthStatus') {
-                reply({ text: `❌ Fehler: ${errText}`, icon: 'no-connection' });
-            } else if (command === 'listDevices') {
-                reply([]);
-            } else {
-                reply({ error: errText });
-            }
-        }
-    }
-
-    /**
-     * Creates an authorization URL and returns it to the admin UI.
-     * It also starts an HTTP/HTTPS callback server that receives the Spotify redirect.
-     * @param {Record<string, any>} msg
-     */
-    async oauthStart(msg) {
-        const clientId = String(msg.clientId ?? this.config.clientId ?? '').trim();
-        const clientSecret = String(msg.clientSecret ?? this.config.clientSecret ?? '').trim();
-        const redirectUri = String(msg.redirectUri ?? this.config.redirectUri ?? '').trim();
-        const bind = String(msg.bind ?? this.config.bind ?? '0.0.0.0').trim() || '0.0.0.0';
-        const useSelfSignedCert =
-            typeof msg.useSelfSignedCert === 'boolean'
-                ? msg.useSelfSignedCert
-                : !!this.config.useSelfSignedCert;
-
-        if (!clientId || !clientSecret) {
-            throw new Error('Bitte Spotify Client ID und Client Secret eintragen und speichern.');
-        }
-        if (!redirectUri) {
-            throw new Error('Bitte Redirect URI (Callback URL) eintragen und speichern.');
-        }
-
-        let redirect;
-        try {
-            redirect = new URL(redirectUri);
-        } catch (e) {
-            throw new Error(`Redirect URI ist ungültig: ${redirectUri}`);
-        }
-
-        const protocol = (redirect.protocol || '').replace(':', '');
-        if (protocol !== 'http' && protocol !== 'https') {
-            throw new Error('Redirect URI muss mit http:// oder https:// beginnen.');
-        }
-
-        const port = redirect.port ? Number(redirect.port) : protocol === 'https' ? 443 : 80;
-        if (!Number.isFinite(port) || port <= 0) {
-            throw new Error('Redirect URI muss einen gültigen Port enthalten (z.B. :8888).');
-        }
-        if (port < 1024) {
-            this.log.warn(
-                `Redirect URI nutzt einen privilegierten Port (${port}). Das funktioniert meist nur mit Root/Capabilities oder Reverse Proxy. Empfehlung: >1024 (z.B. 8888).`
-            );
-        }
-
-        // Ensure callback server is running before opening the auth URL
-        await this.ensureOAuthServer({
-            protocol,
-            port,
-            bind,
-            callbackPath: redirect.pathname || '/',
-            hostnameForCert: redirect.hostname,
-            useSelfSignedCert,
-        });
-
-        // Create state (CSRF protection)
-        const state = crypto.randomBytes(16).toString('hex');
-        const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-        this.oauthFlow = {
-            state,
-            expiresAt,
-            clientId,
-            clientSecret,
-            redirectUri: redirect.toString(),
-            callbackPath: redirect.pathname || '/',
-        };
-
-        // Scopes needed for playback control
-        const scopes = [
-            'user-read-playback-state',
-            'user-read-currently-playing',
-            'user-modify-playback-state',
-        ];
-
-        const params = new URLSearchParams({
-            response_type: 'code',
-            client_id: clientId,
-            redirect_uri: redirect.toString(),
-            scope: scopes.join(' '),
-            state,
-            show_dialog: 'true',
-        });
-
-        const authUrl = `https://accounts.spotify.com/authorize?${params.toString()}`;
-
-        return { openUrl: authUrl };
-    }
-
-    /**
-     * Returns a human readable status for the JSON config UI.
-     */
-    async oauthStatus() {
-        const clientId = String(this.config.clientId || '').trim();
-        const clientSecret = String(this.config.clientSecret || '').trim();
-        const redirectUri = String(this.config.redirectUri || '').trim();
-        const refreshToken = String(this.config.refreshToken || '').trim();
-
-        if (!clientId || !clientSecret) {
-            return {
-                text: '⚠️ Nicht konfiguriert: Client ID / Client Secret fehlen',
-                icon: 'no-connection',
-                style: { color: 'orange' },
-            };
-        }
-        if (!redirectUri) {
-            return {
-                text: '⚠️ Nicht konfiguriert: Redirect URI fehlt',
-                icon: 'no-connection',
-                style: { color: 'orange' },
-            };
-        }
-        if (!refreshToken) {
-            return {
-                text: '❌ Nicht verbunden (kein Refresh-Token). Bitte "Mit Spotify verbinden" klicken.',
-                icon: 'no-connection',
-                style: { color: 'red' },
-            };
-        }
-
-        // Try to validate the token by refreshing access token once
-        try {
-            await this.ensureSpotifyClient();
-            await this.spotify.refreshAccessToken();
-            return { text: '✅ Verbunden', icon: 'connection', style: { color: 'green' } };
-        } catch (e) {
-            const errText = e && e.message ? e.message : String(e);
-            return {
-                text: `❌ Token ungültig oder abgelaufen: ${errText}`,
-                icon: 'no-connection',
-                style: { color: 'red' },
-            };
-        }
-    }
-
-    /**
-     * Clears the stored refresh token.
-     */
-    async oauthDisconnect() {
-        // Clear in memory
-        this.config.refreshToken = '';
-        this.spotify = null;
-        this.setState('info.connection', false, true);
-
-        // Persist (encryptedNative will handle encryption)
-        await this.extendForeignObjectAsync(`system.adapter.${this.namespace}`, {
-            native: { refreshToken: '' },
-        });
-
-        return { native: { refreshToken: '' } };
-    }
-
-    /**
-     * Returns Spotify Connect devices for selectSendTo.
-     */
-    async listDevices() {
-        try {
-            await this.ensureSpotifyClient();
-            await this.spotify.refreshAccessToken();
-            const devices = await this.spotify.getDevices();
-
-            const items = (devices || []).map((d) => ({
-                label: `${d.name} (${d.type}${d.is_active ? ', active' : ''})`,
-                value: d.id,
-            }));
-
-            if (!items.length) {
-                return [{ label: 'Keine Geräte gefunden (Spotify App öffnen?)', value: '' }];
-            }
-
-            return items;
-        } catch (e) {
-            if (this.log && this.log.debug) {
-                const errText = e && e.message ? e.message : String(e);
-                this.log.debug(`listDevices failed: ${errText}`);
-            }
-            return [{ label: 'Nicht verbunden / keine Berechtigung', value: '' }];
-        }
-    }
-
-    async ensureSpotifyClient() {
-        if (this.spotify) return;
-
-        const { clientId, clientSecret, refreshToken } = this.config;
-        if (!clientId || !clientSecret || !refreshToken) {
-            throw new Error('Adapter ist nicht verbunden oder nicht konfiguriert.');
-        }
-
-        this.spotify = new SpotifyClient({
-            clientId,
-            clientSecret,
-            refreshToken,
-            redirectUri: this.config.redirectUri,
-            logApiErrors: !!this.config.logApiErrors,
-            log: this.log,
-        });
-    }
-
-    /**
-     * Starts (or restarts) a small callback server for the OAuth redirect.
-     * @param {{protocol:'http'|'https', port:number, bind:string, callbackPath:string, hostnameForCert?:string, useSelfSignedCert:boolean}} opts
-     */
-    async ensureOAuthServer(opts) {
-        const desired = {
-            protocol: opts.protocol,
-            port: opts.port,
-            bind: opts.bind,
-            callbackPath: opts.callbackPath || '/callback',
-        };
-
-        // If already running with same config, keep it
-        if (
-            this.oauthServer &&
-            this.oauthServerInfo &&
-            this.oauthServerInfo.protocol === desired.protocol &&
-            this.oauthServerInfo.port === desired.port &&
-            this.oauthServerInfo.bind === desired.bind &&
-            this.oauthServerInfo.callbackPath === desired.callbackPath
-        ) {
-            return;
-        }
-
-        // Close previous server
-        if (this.oauthServer) {
-            try {
-                this.oauthServer.close();
-            } catch (e) {
-                // ignore
-            }
-            this.oauthServer = null;
-            this.oauthServerInfo = null;
-        }
-
-        const handler = (req, res) => {
-            this.handleOAuthRequest(req, res).catch((e) => {
-                const errText = e && e.message ? e.message : String(e);
-                this.log.error(`OAuth server request failed: ${errText}`);
-                try {
-                    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-                    res.end('Internal error');
-                } catch (e2) {
-                    // ignore
-                }
-            });
-        };
-
-        if (desired.protocol === 'https') {
-            if (!opts.useSelfSignedCert) {
-                throw new Error(
-                    'Redirect URI nutzt https, aber Self-Signed Zertifikat ist deaktiviert. Bitte aktivieren oder ein Reverse Proxy mit gültigem Zertifikat verwenden.'
-                );
-            }
-
-            // Generate a self-signed certificate (browser will show a warning)
-            const selfsigned = require('selfsigned');
-            const commonName = opts.hostnameForCert || 'localhost';
-            const attrs = [{ name: 'commonName', value: commonName }];
-
-            // SubjectAltName: include hostname as DNS, plus loopback IPs and (if possible) hostname as IP.
-            const altNames = [{ type: 2, value: commonName }, { type: 7, ip: '127.0.0.1' }, { type: 7, ip: '::1' }];
-
-            // If hostname is an IPv4/IPv6 literal, include it as IP SAN
-            if (commonName && net.isIP(commonName)) {
-                altNames.push({ type: 7, ip: commonName });
-            }
-
-            const pems = await selfsigned.generate(attrs, {
-                algorithm: 'sha256',
-                extensions: [
-                    { name: 'basicConstraints', cA: false, critical: true },
-                    { name: 'keyUsage', digitalSignature: true, keyEncipherment: true, critical: true },
-                    { name: 'extKeyUsage', serverAuth: true },
-                    { name: 'subjectAltName', altNames },
-                ],
-            });
-
-            this.oauthServer = https.createServer({ key: pems.private, cert: pems.cert }, handler);
-        } else {
-            this.oauthServer = http.createServer(handler);
-        }
-
-        await new Promise((resolve, reject) => {
-            this.oauthServer.once('error', (err) => reject(err));
-            this.oauthServer.listen(desired.port, desired.bind, () => resolve());
-        });
-
-        this.oauthServerInfo = desired;
-        this.log.info(
-            `OAuth callback server listening on ${desired.protocol}://${desired.bind}:${desired.port}${desired.callbackPath}`
-        );
-    }
-
-    /**
-     * Generic request handler for the OAuth callback server.
-     * @param {import('node:http').IncomingMessage} req
-     * @param {import('node:http').ServerResponse} res
-     */
-    async handleOAuthRequest(req, res) {
-        const method = (req.method || 'GET').toUpperCase();
-        const reqUrl = new URL(req.url || '/', 'http://localhost');
-
-        if (method !== 'GET') {
-            res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end('Method Not Allowed');
-            return;
-        }
-
-        const callbackPath = this.oauthServerInfo?.callbackPath || '/callback';
-
-        if (reqUrl.pathname === callbackPath) {
-            await this.handleOAuthCallback(reqUrl, res);
-            return;
-        }
-
-        // Default page
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(
-            `<html><body style="font-family: sans-serif;">
-            <h2>ioBroker Spotify Premium - OAuth Callback Server</h2>
-            <p>Dieser Server wird nur für den Spotify Login benötigt.</p>
-            <p>Callback Path: <code>${callbackPath}</code></p>
-            </body></html>`
-        );
-    }
-
-    async handleOAuthCallback(reqUrl, res) {
-        const error = reqUrl.searchParams.get('error');
-        const code = reqUrl.searchParams.get('code');
-        const state = reqUrl.searchParams.get('state');
-
-        if (error) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>❌ Spotify Login fehlgeschlagen</h2>
-                <p>Error: <code>${this.escapeHtml(error)}</code></p>
-                <p>Du kannst dieses Fenster schließen.</p>
-                </body></html>`
-            );
-            return;
-        }
-
-        if (!code || !state) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>❌ Ungültiger Callback</h2>
-                <p>Es fehlen Parameter (code/state).</p>
-                </body></html>`
-            );
-            return;
-        }
-
-        if (!this.oauthFlow || !this.oauthFlow.state) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>❌ Login-Session nicht gefunden</h2>
-                <p>Bitte den Login erneut über ioBroker starten.</p>
-                </body></html>`
-            );
-            return;
-        }
-
-        if (Date.now() > (this.oauthFlow.expiresAt || 0)) {
-            this.oauthFlow = null;
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>❌ Login-Session abgelaufen</h2>
-                <p>Bitte den Login erneut starten.</p>
-                </body></html>`
-            );
-            return;
-        }
-
-        if (state !== this.oauthFlow.state) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>❌ Security Check fehlgeschlagen</h2>
-                <p>State passt nicht. Bitte den Login erneut starten.</p>
-                </body></html>`
-            );
-            return;
-        }
-
-        try {
-            const tokenData = await this.exchangeAuthorizationCode(code);
-
-            const newRefresh = tokenData.refresh_token || this.config.refreshToken;
-            if (!newRefresh) {
-                throw new Error(
-                    'Spotify hat kein refresh_token geliefert. Bitte Zugriff entfernen und erneut verbinden.'
-                );
-            }
-
-            // Persist refresh token
-            this.config.refreshToken = newRefresh;
-
-            await this.extendForeignObjectAsync(`system.adapter.${this.namespace}`, {
-                native: { refreshToken: newRefresh },
-            });
-
-            // Prepare Spotify client & start polling (optional)
-            this.spotify = new SpotifyClient({
-                clientId: this.oauthFlow.clientId,
-                clientSecret: this.oauthFlow.clientSecret,
-                refreshToken: newRefresh,
-                redirectUri: this.oauthFlow.redirectUri,
-                logApiErrors: !!this.config.logApiErrors,
-                log: this.log,
-            });
-
-            // Verify token
-            await this.spotify.refreshAccessToken();
-            this.setState('info.connection', true, true);
-
-            // Start polling if not running
-            if (!this.pollTimer) {
-                const intervalSec = Math.max(2, Number(this.config.pollInterval) || 5);
-                this.log.info(`Polling Spotify playback state every ${intervalSec}s`);
-                this.pollTimer = this.setInterval(() => {
-                    this.queueCommand(() => this.pollPlayback());
-                }, intervalSec * 1000);
-            }
-
-            if (this.config.autoRefreshDevicesOnStart) {
-                this.queueCommand(() => this.refreshDevices());
-            }
-
-            this.oauthFlow = null;
-
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>✅ Spotify verbunden</h2>
-                <p>Du kannst dieses Fenster schließen.</p>
-                <p><b>Hinweis:</b> Bitte die ioBroker Admin Konfig-Seite des Adapters einmal neu laden (F5), bevor du speicherst.</p>
-                </body></html>`
-            );
-        } catch (e) {
-            const errText = e && e.message ? e.message : String(e);
-            this.log.error(`OAuth callback failed: ${errText}`);
-            res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(
-                `<html><body style="font-family: sans-serif;">
-                <h2>❌ Fehler beim Token-Austausch</h2>
-                <p>${this.escapeHtml(errText)}</p>
-                <p>Du kannst dieses Fenster schließen und es erneut versuchen.</p>
-                </body></html>`
-            );
-        }
-    }
-
-    async exchangeAuthorizationCode(code) {
-        if (!this.oauthFlow) throw new Error('OAuth flow not initialized');
-
-        const tokenUrl = 'https://accounts.spotify.com/api/token';
-        const body = new URLSearchParams({
-            grant_type: 'authorization_code',
-            code,
-            redirect_uri: this.oauthFlow.redirectUri,
-        });
-
-        const basic = Buffer.from(
-            `${this.oauthFlow.clientId}:${this.oauthFlow.clientSecret}`,
-            'utf8'
-        ).toString('base64');
-
-        const res = await fetch(tokenUrl, {
-            method: 'POST',
-            headers: {
-                Authorization: `Basic ${basic}`,
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body,
-        });
-
-        const text = await res.text();
-        let data;
-        try {
-            data = JSON.parse(text);
-        } catch (e) {
-            data = null;
-        }
-
-        if (!res.ok) {
-            const err = data?.error_description || data?.error || text || res.statusText;
-            throw new Error(`Spotify token error: ${err}`);
-        }
-
-        if (!data || !data.access_token) {
-            throw new Error('Unexpected token response from Spotify.');
-        }
-
-        return data;
-    }
-
-    escapeHtml(str) {
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
-
-
-    /**
-     * Handle state changes (controls).
-     */
     async onStateChange(id, state) {
         if (!state || state.ack) return;
         if (!this.spotify) return;
 
-        // Convert full ID -> relative path within this adapter instance
         const rel = id.startsWith(this.namespace + '.') ? id.substring(this.namespace.length + 1) : id;
         if (!rel.startsWith('control.')) return;
 
         const deviceId = this.config.defaultDeviceId ? String(this.config.defaultDeviceId) : undefined;
 
         const resetButton = async (stateId) => {
-            // Reset "button" states back to false so they can be triggered again
             await this.setStateAsync(stateId, false, true);
         };
 
@@ -833,12 +285,10 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     await this.spotify.play({ deviceId });
                     await resetButton('control.play');
                     break;
-
                 case 'control.pause':
                     await this.spotify.pause({ deviceId });
                     await resetButton('control.pause');
                     break;
-
                 case 'control.toggle': {
                     const isPlayingState = await this.getStateAsync('playback.isPlaying');
                     const isPlaying = !!isPlayingState?.val;
@@ -850,17 +300,14 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     await resetButton('control.toggle');
                     break;
                 }
-
                 case 'control.next':
                     await this.spotify.next({ deviceId });
                     await resetButton('control.next');
                     break;
-
                 case 'control.previous':
                     await this.spotify.previous({ deviceId });
                     await resetButton('control.previous');
                     break;
-
                 case 'control.volume': {
                     const v = Math.max(0, Math.min(100, Number(val)));
                     if (Number.isFinite(v)) {
@@ -869,14 +316,12 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     }
                     break;
                 }
-
                 case 'control.shuffle': {
                     const s = !!val;
                     await this.spotify.setShuffle(s, { deviceId });
                     await this.setStateAsync('control.shuffle', s, true);
                     break;
                 }
-
                 case 'control.repeat': {
                     const r = String(val || '').toLowerCase();
                     const allowed = new Set(['off', 'track', 'context']);
@@ -885,7 +330,6 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     await this.setStateAsync('control.repeat', rr, true);
                     break;
                 }
-
                 case 'control.seek': {
                     const pos = Math.max(0, Number(val));
                     if (Number.isFinite(pos)) {
@@ -894,7 +338,6 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     }
                     break;
                 }
-
                 case 'control.playUri': {
                     const uri = String(val || '').trim();
                     if (uri) {
@@ -903,7 +346,6 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     }
                     break;
                 }
-
                 case 'control.addToQueue': {
                     const uri = String(val || '').trim();
                     if (uri) {
@@ -912,7 +354,6 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     }
                     break;
                 }
-
                 case 'control.transferToDevice': {
                     const target = String(val || '').trim();
                     if (target) {
@@ -921,12 +362,10 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                     }
                     break;
                 }
-
                 case 'control.refreshDevices':
                     await this.refreshDevices();
                     await resetButton('control.refreshDevices');
                     break;
-
                 default:
                     this.log.debug(`Unhandled control state: ${rel}`);
                     break;
@@ -934,24 +373,412 @@ class SpotifyPremiumAdapter extends utils.Adapter {
         });
     }
 
+    /**
+     * Handle Admin sendTo messages (OAuth buttons).
+     */
+    async onMessage(obj) {
+        if (!obj || !obj.command || !obj.callback) return;
+
+        const respond = (data) => {
+            try {
+                this.sendTo(obj.from, obj.command, data, obj.callback);
+            } catch (e) {
+                this.log.warn(`Failed to respond to message: ${e?.message || e}`);
+            }
+        };
+
+        try {
+            const cfg = this.getEffectiveConfigFromMessage(obj.message);
+            switch (obj.command) {
+                case 'oauthGetUrl': {
+                    const url = await this.generateAuthUrl(cfg);
+                    if (!url) return respond('Cannot generate auth URL (check clientId/redirectUri).');
+                    return respond(url);
+                }
+
+                case 'oauthConnect': {
+                    // ensure callback server (start based on current UI values, even if not saved)
+                    await this.startCallbackServer(cfg);
+
+                    const url = await this.generateAuthUrl(cfg);
+                    if (!url) return respond({ openUrl: '', error: 'Cannot generate auth URL' });
+
+                    // openUrl is handled by Admin jsonConfig if openUrl=true on the button
+                    return respond({ openUrl: url, window: 'spotify' });
+                }
+
+                case 'oauthDisconnect': {
+                    await this.clearTokens();
+                    return respond({ reloadBrowser: true });
+                }
+
+                default:
+                    return respond({ error: `Unknown command: ${obj.command}` });
+            }
+        } catch (e) {
+            this.log.warn(`onMessage ${obj.command} failed: ${e?.message || e}`);
+            return respond({ error: e?.message || String(e) });
+        }
+    }
+
+    cleanupOldOauthStates() {
+        const now = Date.now();
+        for (const [state, info] of this.oauthStates.entries()) {
+            if (!info?.createdAt || now - info.createdAt > 10 * 60_000) {
+                this.oauthStates.delete(state);
+            }
+        }
+    }
+
+    async generateAuthUrl(cfgOverride) {
+        const cfg = cfgOverride && typeof cfgOverride === 'object' ? cfgOverride : {};
+        const clientId = String(cfg.clientId || this.config.clientId || '').trim();
+        const redirectUri = safeUrl(String(cfg.redirectUri || this.config.redirectUri || '').trim());
+
+        if (!clientId || !redirectUri) return '';
+
+        this.cleanupOldOauthStates();
+
+        const state = base64UrlEncode(crypto.randomBytes(16));
+        const codeVerifier = base64UrlEncode(crypto.randomBytes(32));
+        const codeChallenge = sha256Base64Url(codeVerifier);
+
+        this.oauthStates.set(state, { codeVerifier, createdAt: Date.now(), clientId, redirectUri });
+
+        const scope = [
+            'user-read-playback-state',
+            'user-modify-playback-state',
+            'user-read-currently-playing'
+        ].join(' ');
+
+        const url = new URL('https://accounts.spotify.com/authorize');
+        url.searchParams.set('client_id', clientId);
+        url.searchParams.set('response_type', 'code');
+        url.searchParams.set('redirect_uri', redirectUri);
+        url.searchParams.set('state', state);
+        url.searchParams.set('scope', scope);
+        url.searchParams.set('code_challenge_method', 'S256');
+        url.searchParams.set('code_challenge', codeChallenge);
+
+        return url.toString();
+    }
+
+    async startCallbackServer(cfgOverride) {
+        const cfg = cfgOverride && typeof cfgOverride === 'object' ? cfgOverride : {};
+
+        const redirectUriStr = String(cfg.redirectUri || this.config.redirectUri || '').trim();
+        if (!redirectUriStr) throw new Error('redirectUri missing');
+
+        let u;
+        try {
+            u = new URL(redirectUriStr);
+        } catch {
+            throw new Error('redirectUri is not a valid URL');
+        }
+
+        const protocol = u.protocol;
+        const cbPath = u.pathname || '/callback';
+        const port = Number(u.port || (protocol === 'https:' ? 443 : 80));
+        const bindIp = String(cfg.callbackBindIp || this.config.callbackBindIp || '0.0.0.0');
+
+        // If server already running but config changed, restart it
+        if (this.server && this.serverInfo) {
+            const same = this.serverInfo.protocol === protocol
+                && this.serverInfo.port === port
+                && this.serverInfo.path === cbPath
+                && this.serverInfo.bindIp === bindIp;
+            if (same) {
+                return;
+            }
+
+            this.log.info(`Callback server config changed -> restarting (${this.serverInfo.protocol}//:${this.serverInfo.port}${this.serverInfo.path} -> ${protocol}//:${port}${cbPath})`);
+            await new Promise((resolve) => {
+                try {
+                    this.server.close(() => resolve());
+                } catch {
+                    resolve();
+                }
+            });
+            this.server = null;
+            this.serverInfo = null;
+        }
+
+        this.serverRuntimeConfig = {
+            generateSelfSignedCert: typeof cfg.generateSelfSignedCert === 'boolean'
+                ? cfg.generateSelfSignedCert
+                : !!this.config.generateSelfSignedCert,
+        };
+
+        this.serverInfo = { protocol, port, path: cbPath, bindIp };
+
+        const requestHandler = (req, res) => {
+            try {
+                const reqUrl = new URL(req.url || '/', `${protocol}//${req.headers.host || 'localhost'}`);
+
+                if (reqUrl.pathname !== cbPath) {
+                    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+                    res.end(`Spotify Premium Adapter callback server is running.\nUse path: ${cbPath}`);
+                    return;
+                }
+
+                const error = reqUrl.searchParams.get('error');
+                const code = reqUrl.searchParams.get('code');
+                const state = reqUrl.searchParams.get('state');
+
+                if (error) {
+                    this.log.warn(`OAuth error from Spotify: ${error}`);
+                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                    res.end(this.renderHtml(`❌ Spotify Login fehlgeschlagen`, `Spotify hat einen Fehler zurückgegeben: <b>${error}</b>.<br/>Du kannst dieses Fenster schließen.`));
+                    return;
+                }
+
+                if (!code || !state) {
+                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                    res.end(this.renderHtml('Spotify OAuth Callback', 'Warte auf Spotify Redirect...'));
+                    return;
+                }
+
+                // Handle exchange async
+                this.handleOAuthCallback({ code, state })
+                    .then((msg) => {
+                        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                        res.end(this.renderHtml('✅ Spotify verbunden', msg));
+                    })
+                    .catch((e) => {
+                        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                        res.end(this.renderHtml('❌ Spotify Login fehlgeschlagen', `${e?.message || e}`));
+                    });
+            } catch (e) {
+                res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end(`Internal error: ${e?.message || e}`);
+            }
+        };
+
+        if (protocol === 'https:') {
+            const { key, cert } = await this.getHttpsKeyCert(u.hostname);
+            this.server = https.createServer({ key, cert }, requestHandler);
+        } else if (protocol === 'http:') {
+            this.server = http.createServer(requestHandler);
+        } else {
+            throw new Error(`Unsupported protocol in redirectUri: ${protocol}`);
+        }
+
+        await new Promise((resolve, reject) => {
+            this.server.once('error', reject);
+            this.server.listen(port, bindIp, () => {
+                this.server.off('error', reject);
+                resolve();
+            });
+        });
+
+        this.log.info(`Callback server listening on ${bindIp}:${port}${cbPath} (${protocol.replace(':', '')})`);
+    }
+
+    async getHttpsKeyCert(hostname) {
+        // Persist cert/key in adapter data dir
+        const dataDir = utils.getAbsoluteInstanceDataDir(this);
+        const keyPath = path.join(dataDir, 'spotify-premium.key.pem');
+        const certPath = path.join(dataDir, 'spotify-premium.cert.pem');
+
+        try {
+            fs.mkdirSync(dataDir, { recursive: true });
+        } catch {
+            // ignore
+        }
+
+        const exists = fs.existsSync(keyPath) && fs.existsSync(certPath);
+        if (exists) {
+            return {
+                key: fs.readFileSync(keyPath),
+                cert: fs.readFileSync(certPath),
+            };
+        }
+
+        const allowSelfSigned = this.serverRuntimeConfig
+            ? !!this.serverRuntimeConfig.generateSelfSignedCert
+            : !!this.config.generateSelfSignedCert;
+
+        if (!allowSelfSigned) {
+            throw new Error('HTTPS redirectUri configured but no certificate exists and generateSelfSignedCert is disabled');
+        }
+
+        if (!selfsigned) {
+            throw new Error('Package "selfsigned" is not available to generate a certificate');
+        }
+
+        const cn = hostname || 'iobroker';
+        const attrs = [{ name: 'commonName', value: cn }];
+
+        const altNames = [];
+        // DNS
+        if (hostname && net.isIP(hostname) === 0) {
+            altNames.push({ type: 2, value: hostname });
+        }
+        // IP
+        if (hostname && net.isIP(hostname) !== 0) {
+            altNames.push({ type: 7, ip: hostname });
+        }
+        // Always add localhost as DNS
+        altNames.push({ type: 2, value: 'localhost' });
+        const pems = selfsigned.generate(attrs, {
+            keySize: 2048,
+            days: 3650,
+            algorithm: 'sha256',
+            extensions: [
+                {
+                    name: 'subjectAltName',
+                    altNames,
+                },
+            ],
+        });
+
+        fs.writeFileSync(keyPath, pems.private);
+        fs.writeFileSync(certPath, pems.cert);
+
+        this.log.warn(`Generated self-signed certificate for HTTPS callback. Browser will show a warning on first visit.`);
+
+        return { key: pems.private, cert: pems.cert };
+    }
+
+    renderHtml(title, bodyHtml) {
+        return `<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>${title}</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 24px; }
+    .box { max-width: 720px; margin: 0 auto; border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
+    h2 { margin-top: 0; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>${title}</h2>
+    <div>${bodyHtml}</div>
+    <p style="margin-top:18px;color:#666;font-size:13px;">Du kannst dieses Fenster schließen.</p>
+    <script>
+      // Try to close window (may be blocked by browser)
+      setTimeout(() => { try { window.close(); } catch(e) {} }, 1500);
+    </script>
+  </div>
+</body>
+</html>`;
+    }
+
+    async handleOAuthCallback({ code, state }) {
+        const entry = this.oauthStates.get(state);
+        if (!entry) {
+            throw new Error('Invalid or expired state. Please start login again from ioBroker Admin.');
+        }
+
+        const clientId = String(entry.clientId || this.config.clientId || '').trim();
+        const redirectUri = safeUrl(String(entry.redirectUri || this.config.redirectUri || '').trim());
+        const codeVerifier = entry.codeVerifier;
+
+        this.oauthStates.delete(state);
+
+        // Exchange authorization code for tokens
+        const tokenUrl = 'https://accounts.spotify.com/api/token';
+        const body = new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: String(code),
+            redirect_uri: redirectUri,
+            client_id: clientId,
+            code_verifier: codeVerifier,
+        });
+
+        const res = await fetch(tokenUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body,
+        });
+
+        const text = await res.text();
+        let data = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch {
+            data = null;
+        }
+
+        if (!res.ok) {
+            const msg = data?.error_description || data?.error || text || res.statusText;
+            throw new Error(`Token exchange failed (${res.status}): ${msg}`);
+        }
+
+        const refreshToken = data?.refresh_token;
+        if (!refreshToken) {
+            throw new Error('Spotify did not return a refresh_token. Ensure you used Authorization Code + PKCE flow and scopes are correct.');
+        }
+
+        await this.saveRefreshToken({ refreshToken, clientId, redirectUri });
+
+        // (Re)initialize Spotify client
+        await this.initSpotifyClient();
+
+        return `Spotify ist jetzt verbunden ✅<br/>Zurück zu ioBroker Admin → Instanz-Einstellungen. Falls der Refresh-Token im Feld noch leer aussieht: Seite einmal neu laden (F5).`;
+    }
+
+    async saveRefreshToken({ refreshToken, clientId, redirectUri }) {
+        const token = String(refreshToken);
+        const cid = String(clientId || '').trim();
+        const ruri = String(redirectUri || '').trim();
+
+        // Update in-memory config for the running instance
+        this.config.refreshToken = token;
+        if (cid) this.config.clientId = cid;
+        if (ruri) this.config.redirectUri = ruri;
+
+        const id = `system.adapter.${this.namespace}`;
+        const obj = await this.getForeignObjectAsync(id);
+        if (!obj) throw new Error(`Cannot load instance object ${id}`);
+
+        obj.native = obj.native || {};
+
+        // Store plain; js-controller/admin will auto-encrypt fields listed in encryptedNative.
+        obj.native.refreshToken = token;
+        if (cid) obj.native.clientId = cid;
+        if (ruri) obj.native.redirectUri = ruri;
+        await this.setForeignObjectAsync(id, obj);
+
+        this.log.info('Refresh token stored in instance configuration.');
+    }
+
+    async clearTokens() {
+        const id = `system.adapter.${this.namespace}`;
+        const obj = await this.getForeignObjectAsync(id);
+        if (!obj) return;
+
+        obj.native = obj.native || {};
+        obj.native.refreshToken = '';
+        await this.setForeignObjectAsync(id, obj);
+
+        this.config.refreshToken = '';
+        this.spotify = null;
+        await this.setStateAsync('info.connection', false, true);
+
+        this.log.info('Spotify connection removed (refresh token cleared).');
+    }
+
     onUnload(callback) {
         try {
             if (this.pollTimer) this.clearInterval(this.pollTimer);
-
-            if (this.oauthServer) {
+            if (this.server) {
                 try {
-                    this.oauthServer.close();
-                } catch (e) {
+                    this.server.close();
+                } catch {
                     // ignore
                 }
-                this.oauthServer = null;
-                this.oauthServerInfo = null;
-                this.oauthFlow = null;
+                this.server = null;
             }
-
             this.setState('info.connection', false, true);
             callback();
-        } catch (e) {
+        } catch {
             callback();
         }
     }
