@@ -445,11 +445,19 @@ class SpotifyPremiumAdapter extends utils.Adapter {
 
         this.oauthStates.set(state, { codeVerifier, createdAt: Date.now(), clientId, redirectUri });
 
-        const scope = [
+        const scopes = [
             'user-read-playback-state',
             'user-modify-playback-state',
             'user-read-currently-playing'
-        ].join(' ');
+        ];
+
+        const includeStreaming = typeof cfg.includeStreamingScope === 'boolean'
+            ? cfg.includeStreamingScope
+            : !!this.config.includeStreamingScope;
+
+        if (includeStreaming) scopes.push('streaming');
+
+        const scope = scopes.join(' ');
 
         const url = new URL('https://accounts.spotify.com/authorize');
         url.searchParams.set('client_id', clientId);
@@ -533,8 +541,21 @@ class SpotifyPremiumAdapter extends utils.Adapter {
                 }
 
                 if (!code || !state) {
-                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                    res.end(this.renderHtml('Spotify OAuth Callback', 'Warte auf Spotify Redirect...'));
+                    // Treat direct visit to the callback URL as "start login" (avoids popup blockers in Admin)
+                    this.generateAuthUrl()
+                        .then((authUrl) => {
+                            if (!authUrl) {
+                                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                                res.end(this.renderHtml('Spotify Login', 'Bitte zuerst <b>Client ID</b> und <b>Redirect URI</b> in ioBroker Admin eintragen, <b>Speichern</b> und den Adapter neu starten.<br/>Danach diese URL erneut öffnen.'));
+                                return;
+                            }
+                            res.writeHead(302, { Location: authUrl });
+                            res.end();
+                        })
+                        .catch((e) => {
+                            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                            res.end(this.renderHtml('❌ Spotify Login fehlgeschlagen', `${e?.message || e}`));
+                        });
                     return;
                 }
 

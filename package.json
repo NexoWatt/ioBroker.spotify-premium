@@ -1,6 +1,6 @@
 {
   "name": "iobroker.spotify-premium",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Control Spotify Premium playback via ioBroker (Spotify Connect) using Spotify Web API with OAuth login.",
   "main": "main.js",
   "license": "MIT",

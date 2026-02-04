@@ -1,27 +1,59 @@
 # ioBroker.spotify-premium
 
-Control **Spotify Premium** playback (Spotify Connect) via the **Spotify Web API**.
+Steuere **Spotify Premium** (Spotify Connect) über ioBroker via **Spotify Web API**.
+
+> Hinweis: Dieser Adapter **steuert** Spotify (Play/Pause/Next/Device/Volume …).  
+> Er ist **kein** eigener Audio-Player. Wenn du ioBroker als *eigene* Spotify-Connect-Quelle nutzen willst, brauchst du zusätzlich einen Player (z.B. einen Browser mit **Web Playback SDK** oder ein externes Spotify-Connect-Gerät).
 
 ## Features
-- OAuth login via Admin (Authorization Code + PKCE)
-- Poll current playback state
-- Control playback: play/pause/toggle/next/prev/volume/shuffle/repeat/seek/playUri/addToQueue/transfer
+- OAuth Login (Authorization Code + PKCE)
+- Polling: aktueller Playback-Status / Track / Gerät / Lautstärke
+- Steuerung: play/pause/toggle/next/prev/volume/shuffle/repeat/seek/playUri/addToQueue/transfer
 
-## Spotify requirements
-- Spotify Premium is required for certain playback-control endpoints.
-- You must create a Spotify Developer App (Client ID, optional Client Secret) and whitelist your Redirect URI.
+## Spotify Voraussetzungen
+- Spotify Premium (für einige Playback-Features notwendig)
+- Spotify Developer App (Client ID; Client Secret optional)
 
-**Redirect URI requirements** (Spotify):
-- Use **HTTPS** unless using a loopback IP literal like `http://127.0.0.1:PORT`
-- `localhost` is **not allowed**
+**Redirect-URI Regeln (Spotify):**
+- Nutze **HTTPS**, außer bei Loopback-IP literal wie `http://127.0.0.1:PORT`
+- `localhost` ist nicht erlaubt
 
-## Setup (recommended)
-1. Create a Spotify developer app and add Redirect URI, e.g. `https://<iobroker-ip>:8888/callback`
-2. Configure adapter instance: Client ID + Redirect URI (Secret optional)
-3. Start instance
-4. In instance config click **MIT SPOTIFY VERBINDEN** and login
+## Setup
+1. Spotify Developer Dashboard → App anlegen → **Redirect URI** hinzufügen, z.B.  
+   `https://<iobroker-ip>:8888/callback`
+2. Adapter konfigurieren:
+   - **Client ID**
+   - **Redirect URI**
+   - optional **Client Secret** (nicht nötig bei PKCE)
+3. **Speichern** und Adapter neu starten
+4. In der Instanz-Konfiguration auf **MIT SPOTIFY VERBINDEN** klicken  
+   → es öffnet sich deine **Redirect-URI** in einem neuen Tab  
+   → der Adapter startet automatisch den Spotify Login (kein Popup-Blocker-Problem)
 
-If you use HTTPS with self-signed cert: open the callback URL once manually to accept the cert in the browser.
+### HTTPS / Self-Signed Zertifikat
+Wenn du HTTPS nutzt und kein eigenes Zertifikat hast, kann der Adapter eins generieren.  
+Beim ersten Öffnen der Redirect-URL zeigt der Browser eine Warnung. Einmal akzeptieren → danach passt es.
 
-## Notes
-This is a generated adapter repo meant as a starting point.
+### Optional: Web Playback SDK / Streaming Scope
+Wenn du später einen Browser-Webplayer (Spotify **Web Playback SDK**) nutzen willst, aktiviere in der Config:
+- **Web Playback SDK / Streaming Scope (optional)**
+
+Hinweis: Das Web Playback SDK ist „client-side only“ und läuft im Browser:
+https://developer.spotify.com/documentation/web-playback-sdk
+
+Scopes:
+https://developer.spotify.com/documentation/web-api/concepts/scopes
+
+## Troubleshooting
+### „Mit Spotify verbinden“ öffnet nichts
+Der neue Flow öffnet die **Redirect-URI** (Callback-URL) – kein Popup.  
+Wenn gar nichts passiert:
+- Prüfe, ob Redirect-URI korrekt ist und der Adapter läuft
+- Öffne die Redirect-URI testweise direkt im Browser
+
+### Spotify Login klappt, aber danach ist kein Token da
+- Nach dem Login die Admin-Seite einmal neu laden (F5)
+- In die Logs schauen (Adapter-Log)
+
+---
+Generated starter adapter.

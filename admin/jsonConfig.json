@@ -12,7 +12,7 @@
         },
         "_info": {
           "type": "staticText",
-          "text": "Wichtig: Spotify nutzt OAuth. Du meldest dich bei Spotify an (im Browser), danach speichert der Adapter automatisch ein Refresh-Token.\n\nRedirect-URI Regeln: HTTPS ist Pflicht, außer bei Loopback (z.B. http://127.0.0.1:PORT). \"localhost\" ist nicht erlaubt.\n\nTipp (HTTPS + Self-Signed): Öffne die Callback-URL einmal manuell, um das Zertifikat im Browser zu akzeptieren (Warnung -> Erweitert -> Trotzdem öffnen).\n\nHinweis: Nach erfolgreichem Login bitte die Konfig-Seite einmal neu laden (F5), bevor du 'Speichern' klickst – sonst könnte ein altes (leeres) Token versehentlich überschrieben werden."
+          "text": "**Wichtig:** Spotify nutzt OAuth. Du meldest dich bei Spotify an (im Browser), danach speichert der Adapter automatisch ein Refresh-Token.\n\n✅ **Empfohlen:** Der Button **„MIT SPOTIFY VERBINDEN“** öffnet deine **Redirect-URI / Callback-URL** in einem neuen Tab. Der Adapter startet darüber automatisch den Spotify-Login (kein Popup-Blocker-Problem).\n\n**Redirect-URI Regeln:** HTTPS ist Pflicht, außer bei Loopback (z.B. http://127.0.0.1:PORT). \"localhost\" ist nicht erlaubt.\n\n👉 **Tipp (HTTPS + Self-Signed):** Wenn du eine self-signed HTTPS Callback-URL nutzt, musst du die Zertifikat-Warnung im Browser einmal bestätigen („Erweitert“ → „Trotzdem öffnen“). Danach funktioniert der Login-Redirect normal.\n\nℹ️ **Hinweis:** Nach erfolgreichem Login bitte die Konfig-Seite einmal neu laden (F5), bevor du 'Speichern' klickst – sonst könnte ein altes (leeres) Token versehentlich überschrieben werden."
         },
         "clientId": {
           "type": "text",
@@ -59,19 +59,25 @@
           "sm": 12,
           "md": 6
         },
+        "includeStreamingScope": {
+          "type": "checkbox",
+          "label": "Web Playback SDK / Streaming Scope (optional)",
+          "sm": 12,
+          "tooltip": "Aktivieren, wenn du später einen Browser-Webplayer (Spotify Web Playback SDK) nutzen willst. Für reine Fernsteuerung von Spotify-Connect-Geräten nicht nötig.",
+          "default": false
+        },
         "_divider1": {
           "type": "divider",
           "height": 2
         },
         "_connect": {
-          "type": "sendTo",
+          "type": "staticLink",
           "label": "MIT SPOTIFY VERBINDEN",
-          "command": "oauthConnect",
-          "jsonData": "{\"clientId\":\"${data.clientId}\",\"clientSecret\":\"${data.clientSecret}\",\"redirectUri\":\"${data.redirectUri}\",\"callbackBindIp\":\"${data.callbackBindIp}\",\"generateSelfSignedCert\":${data.generateSelfSignedCert},\"_origin\":\"${data._origin}\",\"_originIp\":\"${data._originIp}\"}",
-          "openUrl": true,
-          "window": "spotify",
-          "icon": "auth",
+          "href": "${data.redirectUri}",
+          "target": "_blank",
+          "button": true,
           "variant": "contained",
+          "icon": "auth",
           "disabled": "!data.clientId || !data.redirectUri"
         },
         "_disconnect": {
